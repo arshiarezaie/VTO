@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Virtual Try-On عینک</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+    }
+
+    body {
+      position: relative;
+    }
+
+    /* تصویر دوربین */
+    #webcam {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+      transform: scaleX(-1);
+      background: #000;
+      z-index: 1;
+    }
+
+    /* لایه عینک */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    .status {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+
+      max-width: calc(100vw - 24px);
+      padding: 8px 11px;
+
+      color: #9cffc7;
+      background: rgba(0, 0, 0, 0.72);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+
+      direction: rtl;
+      font-size: 12px;
+      line-height: 1.5;
+
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .start-button {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      z-index: 10;
+
+      transform: translateX(-50%);
+
+      border: none;
+      border-radius: 999px;
+      padding: 14px 24px;
+
+      color: #fff;
+      background: linear-gradient(135deg, #0078d4, #005a9e);
+
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+
+      box-shadow: 0 10px 28px rgba(0, 120, 212, 0.35);
+    }
+
+    .start-button:active {
+      transform: translateX(-50%) scale(0.97);
+    }
+
+    @media (max-width: 600px) {
+      .status {
+        top: 8px;
+        left: 8px;
+        font-size: 10px;
+      }
+
+      .start-button {
+        bottom: 18px;
+        padding: 13px 20px;
+        font-size: 14px;
+      }
+    }
+  </style>
+
+  <!-- MediaPipe -->
+  <script
+    src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"
+    crossorigin="anonymous">
+  </script>
+
+  <script
+    src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"
+    crossorigin="anonymous">
+  </script>
+</head>
+
+<body>
+  <video id="webcam" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="status" class="status">
+    آماده شروع
+  </div>
+
+  <button id="startButton" class="start-button">
+    شروع تست عینک
+  </button>
+
+  <script>
+    /*
+      =====================================================
+      تنظیمات اصلی محصول
+      =====================================================
+    */
+
+    // نام عکس عینک که کنار همین فایل HTML قرار دارد
+    const GLASSES_IMAGE_PATH =
+      "TN3MHuM7kAXdDAVZiAQDadjOJbY-3g7D_VPhSFC1xyvnDjcp6g.png";
+
+    /*
+      عرض واقعی جلوی فریم بر حسب میلی‌متر.
+
+      این مقدار را برای هر محصول تغییر بده.
+      مثال:
+      120 یعنی فریم 120 میلی‌متر
+      135 یعنی فریم 135 میلی‌متر
+      140 یعنی فریم 140 میلی‌متر
+      150 یعنی فریم 150 میلی‌متر
+    */
+    const FRAME_WIDTH_MM = 145;
+
+    /*
+      عرض مرجع فریمی که ضریب اولیه سیستم بر اساس آن تنظیم شده است.
+      فعلاً این مقدار را تغییر نده.
+    */
+    const REFERENCE_FRAME_WIDTH_MM = 140;
+
+    /*
+      ضریب پایه اندازه عینک نسبت به فاصله دو چشم.
+      این ضریب برای عکس عینک فعلی تنظیم شده است.
+    */
+    const BASE_FRAME_SCALE = 2.35;
+
+    /*
+      مقدار نرمی حرکت.
+      عدد بزرگ‌تر یعنی واکنش سریع‌تر.
+      عدد کوچک‌تر یعنی حرکت نرم‌تر ولی کمی کندتر.
+    */
+    const POSITION_SMOOTHING = 0.38;
+    const WIDTH_SMOOTHING = 0.32;
+    const ANGLE_SMOOTHING = 0.28;
+
+    /*
+      اندازه دوربین ورودی MediaPipe.
+      خود MediaPipe روی موبایل اندازه واقعی ویدئو را تشخیص می‌دهد.
+    */
+    const VIDEO_WIDTH = 1280;
+    const VIDEO_HEIGHT = 720;
+
+
+    /*
+      =====================================================
+      عناصر صفحه
+      =====================================================
+    */
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+
+    const statusElement = document.getElementById("status");
+    const startButton = document.getElementById("startButton");
+
+    const glassesImage = new Image();
+    glassesImage.src = GLASSES_IMAGE_PATH;
+
+
+    /*
+      =====================================================
+      وضعیت داخلی سیستم
+      =====================================================
+    */
+
+    let smoothX = null;
+    let smoothY = null;
+    let smoothWidth = null;
+    let smoothAngle = null;
+
+    let noFaceFrames = 0;
+
+
+    /*
+      =====================================================
+      توابع کمکی
+      =====================================================
+    */
+
+    function setStatus(message, isError = false) {
+      statusElement.textContent = message;
+      statusElement.style.color = isError
+        ? "#ff9b9b"
+        : "#9cffc7";
+
+      if (isError) {
+        console.error(message);
+      } else {
+        console.log(message);
+      }
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function lerp(current, target, amount) {
+      return current + (target - current) * amount;
+    }
+
+    function lerpAngle(current, target, amount) {
+      let difference = target - current;
+
+      while (difference > Math.PI) {
+        difference -= Math.PI * 2;
+      }
+
+      while (difference < -Math.PI) {
+        difference += Math.PI * 2;
+      }
+
+      return current + difference * amount;
+    }
+
+    function distance(pointA, pointB) {
+      return Math.hypot(
+        pointA.x - pointB.x,
+        pointA.y - pointB.y
+      );
+    }
+
+    function midpoint(pointA, pointB) {
+      return {
+        x: (pointA.x + pointB.x) / 2,
+        y: (pointA.y + pointB.y) / 2
+      };
+    }
+
+
+    /*
+      =====================================================
+      تنظیم اندازه Canvas
+      =====================================================
+    */
+
+    function resizeCanvas() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+
+      /*
+        از این به بعد مختصات ما بر اساس پیکسل CSS محاسبه می‌شوند،
+        نه پیکسل خام صفحه موبایل.
+      */
+      ctx.setTransform(
+        pixelRatio,
+        0,
+        0,
+        pixelRatio,
+        0,
+        0
+      );
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    window.addEventListener("orientationchange", () => {
+      setTimeout(resizeCanvas, 250);
+    });
+
+
+    /*
+      =====================================================
+      تبدیل مختصات MediaPipe به مختصات واقعی صفحه
+      =====================================================
+
+      این بخش مشکل اصلی موبایل را حل می‌کند.
+
+      چون ویدئو object-fit: cover دارد، در موبایل بخشی
+      از تصویر دوربین بریده می‌شود. این تابع مقدار برش را
+      محاسبه می‌کند تا عینک دقیقاً روی صورت دیده شود.
+    */
+
+    function mediaPipeToScreen(point) {
+      const videoWidth = video.videoWidth || VIDEO_WIDTH;
+      const videoHeight = video.videoHeight || VIDEO_HEIGHT;
+
+      const screenWidth = canvas.clientWidth;
+      const screenHeight = canvas.clientHeight;
+
+      /*
+        محاسبه scale مربوط به object-fit: cover
+      */
+      const coverScale = Math.max(
+        screenWidth / videoWidth,
+        screenHeight / videoHeight
+      );
+
+      const renderedVideoWidth = videoWidth * coverScale;
+      const renderedVideoHeight = videoHeight * coverScale;
+
+      /*
+        مقدار برش تصویر در اطراف صفحه
+      */
+      const cropX =
+        (screenWidth - renderedVideoWidth) / 2;
+
+      const cropY =
+        (screenHeight - renderedVideoHeight) / 2;
+
+      /*
+        تصویر ویدئو به صورت افقی آینه شده است.
+        بنابراین x را با 1 - point.x تبدیل می‌کنیم.
+      */
+      return {
+        x: cropX + (1 - point.x) * renderedVideoWidth,
+        y: cropY + point.y * renderedVideoHeight
+      };
+    }
+
+
+    /*
+      =====================================================
+      پاک‌سازی وضعیت نرم‌کننده
+      =====================================================
+    */
+
+    function resetSmoothing() {
+      smoothX = null;
+      smoothY = null;
+      smoothWidth = null;
+      smoothAngle = null;
+    }
+
+
+    /*
+      =====================================================
+      رسم عینک
+      =====================================================
+    */
+
+    function drawGlasses(results) {
+      const screenWidth = canvas.clientWidth;
+      const screenHeight = canvas.clientHeight;
+
+      ctx.clearRect(0, 0, screenWidth, screenHeight);
+
+      const faces = results.multiFaceLandmarks;
+
+      if (!faces || faces.length === 0) {
+        noFaceFrames++;
+
+        /*
+          بعد از چند فریم بدون چهره، وضعیت قبلی پاک می‌شود
+          تا وقتی کاربر دوباره جلوی دوربین آمد، عینک از جای
+          قدیمی شروع نکند.
+        */
+        if (noFaceFrames > 8) {
+          resetSmoothing();
+        }
+
+        return;
+      }
+
+      if (
+        !glassesImage.complete ||
+        glassesImage.naturalWidth === 0
+      ) {
+        return;
+      }
+
+      noFaceFrames = 0;
+
+      const landmarks = faces[0];
+
+
+      /*
+        =====================================================
+        پیدا کردن مرکز چشم‌ها
+        =====================================================
+
+        برای هر چشم از دو نقطه استفاده می‌کنیم.
+        این کار نسبت به استفاده از فقط یک گوشه چشم پایدارتر است.
+      */
+
+      const eyeAStart = mediaPipeToScreen(landmarks[33]);
+      const eyeAEnd = mediaPipeToScreen(landmarks[133]);
+
+      const eyeBStart = mediaPipeToScreen(landmarks[362]);
+      const eyeBEnd = mediaPipeToScreen(landmarks[263]);
+
+      const eyeA = midpoint(eyeAStart, eyeAEnd);
+      const eyeB = midpoint(eyeBStart, eyeBEnd);
+
+      /*
+        تشخیص می‌دهیم کدام چشم در سمت چپ صفحه است.
+        این کار باعث می‌شود فرمول زاویه روی موبایل هم صحیح باشد.
+      */
+      const leftEye = eyeA.x < eyeB.x ? eyeA : eyeB;
+      const rightEye = eyeA.x < eyeB.x ? eyeB : eyeA;
+
+      /*
+        فاصله دو چشم روی صفحه
+      */
+      const eyeDistance = distance(leftEye, rightEye);
+
+      if (eyeDistance < 10) {
+        return;
+      }
+
+
+      /*
+        =====================================================
+        محاسبه زاویه سر
+        =====================================================
+
+        فقط کجی واقعی سر را از خط بین دو چشم می‌گیریم.
+        وقتی کاربر به چپ یا راست می‌رود، فریم نباید
+        بی‌دلیل روی صورت بچرخد.
+      */
+      let targetAngle = Math.atan2(
+        rightEye.y - leftEye.y,
+        rightEye.x - leftEye.x
+      );
+
+      /*
+        جلوگیری از چرخش‌های غیرطبیعی در اثر خطای تشخیص
+      */
+      targetAngle = clamp(
+        targetAngle,
+        -0.45,
+        0.45
+      );
+
+
+      /*
+        =====================================================
+        نقطه قرارگیری عینک
+        =====================================================
+      */
+
+      /*
+        نقطه 168 روی پل بینی قرار دارد و برای قرار دادن
+        مرکز فریم مناسب است.
+      */
+      const noseBridge = mediaPipeToScreen(landmarks[168]);
+noseBridge.y += 35;
+      /*
+        =====================================================
+        محاسبه اندازه خودکار فریم
+        =====================================================
+      */
+
+      /*
+        نسبت عرض محصول فعلی به محصول مرجع.
+        مثلاً اگر فریم 126 میلی‌متر باشد:
+
+        126 / 140 = 0.9
+
+        پس نسبت به فریم مرجع، کمی کوچک‌تر نمایش داده می‌شود.
+      */
+      const productSizeRatio =
+        FRAME_WIDTH_MM / REFERENCE_FRAME_WIDTH_MM;
+
+      /*
+        اندازه فریم فقط از روی فاصله چشم‌ها محاسبه می‌شود.
+        دیگر هیچ نوار تنظیمی برای مشتری وجود ندارد.
+      */
+      const targetWidth =
+        eyeDistance *
+        BASE_FRAME_SCALE *
+        productSizeRatio;
+
+      /*
+        اگر عکس یا تشخیص صورت لحظه‌ای مقدار غیرعادی داد،
+        جلوی بزرگ یا کوچک شدن ناگهانی فریم را می‌گیریم.
+      */
+      const safeTargetWidth = clamp(
+        targetWidth,
+        80,
+        900
+      );
+
+
+      /*
+        =====================================================
+        نرم کردن حرکت فریم
+        =====================================================
+      */
+
+      if (smoothX === null) {
+        smoothX = noseBridge.x;
+        smoothY = noseBridge.y;
+        smoothWidth = safeTargetWidth;
+        smoothAngle = targetAngle;
+      } else {
+        smoothX = lerp(
+          smoothX,
+          noseBridge.x,
+          POSITION_SMOOTHING
+        );
+
+        smoothY = lerp(
+          smoothY,
+          noseBridge.y,
+          POSITION_SMOOTHING
+        );
+
+        smoothWidth = lerp(
+          smoothWidth,
+          safeTargetWidth,
+          WIDTH_SMOOTHING
+        );
+
+        smoothAngle = lerpAngle(
+          smoothAngle,
+          targetAngle,
+          ANGLE_SMOOTHING
+        );
+      }
+
+
+      /*
+        نسبت ارتفاع به عرض عکس عینک
+      */
+      const imageAspect =
+        glassesImage.naturalHeight /
+        glassesImage.naturalWidth;
+
+      const finalHeight =
+        smoothWidth * imageAspect;
+
+
+      /*
+        =====================================================
+        رسم نهایی عینک
+        =====================================================
+      */
+
+      ctx.save();
+
+      ctx.translate(smoothX, smoothY);
+      ctx.rotate(smoothAngle);
+
+      ctx.drawImage(
+        glassesImage,
+        -smoothWidth / 2,
+        -finalHeight / 2,
+        smoothWidth,
+        finalHeight
+      );
+
+      ctx.restore();
+    }
+
+
+    /*
+      =====================================================
+      شروع دوربین و MediaPipe
+      =====================================================
+    */
+
+    startButton.addEventListener("click", async () => {
+      startButton.style.display = "none";
+      setStatus("در حال آماده‌سازی دوربین...");
+
+      try {
+        /*
+          صبر می‌کنیم عکس عینک حتماً لود شده باشد
+        */
+        await new Promise((resolve, reject) => {
+          if (
+            glassesImage.complete &&
+            glassesImage.naturalWidth > 0
+          ) {
+            resolve();
+            return;
+          }
+
+          glassesImage.onload = resolve;
+
+          glassesImage.onerror = () => {
+            reject(
+              new Error(
+                "عکس عینک پیدا نشد: " +
+                GLASSES_IMAGE_PATH
+              )
+            );
+          };
+        });
+
+        setStatus("عکس عینک آماده شد");
+
+        resizeCanvas();
+        resetSmoothing();
+
+        const faceMesh = new FaceMesh({
+          locateFile: (file) => {
+            return (
+              "https://cdn.jsdelivr.net/npm/" +
+              "@mediapipe/face_mesh/" +
+              file
+            );
+          }
+        });
+
+        faceMesh.setOptions({
+          maxNumFaces: 1,
+          refineLandmarks: true,
+          minDetectionConfidence: 0.6,
+          minTrackingConfidence: 0.6
+        });
+
+        faceMesh.onResults((results) => {
+          drawGlasses(results);
+        });
+
+        const camera = new Camera(video, {
+          onFrame: async () => {
+            await faceMesh.send({
+              image: video
+            });
+          },
+          width: VIDEO_WIDTH,
+          height: VIDEO_HEIGHT
+        });
+
+        await camera.start();
+
+        /*
+          بعد از فعال شدن دوربین، ابعاد واقعی ویدئو مشخص می‌شود.
+          دوباره Canvas را تنظیم می‌کنیم.
+        */
+        resizeCanvas();
+
+        setStatus("دوربین فعال است؛ روبه‌روی دوربین قرار بگیرید");
+      } catch (error) {
+        const message =
+          error && error.message
+            ? error.message
+            : String(error);
+
+        setStatus(message, true);
+        startButton.style.display = "block";
+      }
+    });
+  </script>
+</body>
+</html>
